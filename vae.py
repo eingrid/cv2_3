@@ -78,15 +78,16 @@ class VAE_Loss(torch.nn.Module):
         # print(batch_size)
         # KL Divergence loss
         # Formula: 0.5 * (mu^2 + exp(log_var) - log_var - 1)
-        kl_divergence = torch.mean(-0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp()),axis=0)
+        kl_divergence = torch.mean(-0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(),axis=1),axis=0)
+
         kl_loss = kl_divergence 
         # Total VAE loss
         # print("KL", kl_loss)
         # print("KL scaled", kl_loss * 1e-3)
         # print("REC", reconstruction_loss)
-        total_loss = reconstruction_loss + kl_loss  * beta
+        total_loss = reconstruction_loss + kl_loss  * self.beta
         # print(total_loss)
-        return total_loss
+        return total_loss, reconstruction_loss, kl_loss
 
 
 class VAE(nn.Module):
@@ -95,17 +96,19 @@ class VAE(nn.Module):
         self.latent_dim = latent_dim
         self.encoder = nn.Sequential(
         nn.Conv2d(1, 16, kernel_size=4, stride=2, padding=1), # 1x28x28 -> 64x14x14
-        nn.ReLU(),
+        nn.GELU(),
         nn.Dropout(dropout_prob),
-        nn.Conv2d(16, 16, kernel_size=4, stride=2, padding=1), # 16x14x14 -> 16x7x7
-        nn.ReLU(),
+        nn.Conv2d(16, 64, kernel_size=4, stride=2, padding=1), # 16x14x14 -> 16x7x7
+        nn.GELU(),
         nn.Dropout(dropout_prob),
-        nn.Conv2d(16, 16, kernel_size=3, stride=1, padding=1), # 16x7x7 -> 16x7x7
-        nn.ReLU(),
+        nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1), # 16x7x7 -> 16x7x7
+        nn.GELU(),
+        nn.Conv2d(128, 16, kernel_size=3, stride=1, padding=1), # 16x7x7 -> 16x7x7
+        nn.GELU(),
         nn.Dropout(dropout_prob),
         nn.Flatten(),
         nn.Linear(784, 784), # Intermediate projection
-        nn.ReLU(),
+        nn.GELU(),
         nn.Dropout(dropout_prob)
         )
         self.fc_mu = nn.Linear(784, latent_dim)
@@ -113,14 +116,16 @@ class VAE(nn.Module):
 
         self.decoder = nn.Sequential(
         nn.Linear(latent_dim, 784), # Match intermediate projection
-        nn.ReLU(),
+        nn.GELU(),
         nn.Dropout(dropout_prob),
         nn.Unflatten(1, (16, 7, 7)), # Reshape to 1024x1x1
-        nn.ConvTranspose2d(16, 16, kernel_size=3, stride=1, padding=1), # 16x7x7 -> 16x7x7
-        nn.ReLU(),
+        nn.ConvTranspose2d(16, 64, kernel_size=3, stride=1, padding=1), # 16x7x7 -> 16x7x7
+        nn.GELU(),
+        nn.ConvTranspose2d(64, 128, kernel_size=3, stride=1, padding=1), # 16x7x7 -> 16x7x7
+        nn.GELU(),
         nn.Dropout(dropout_prob),
-        nn.ConvTranspose2d(16, 16, kernel_size=4, stride=2, padding=1), # 16x7x7 -> 16x14x14
-        nn.ReLU(),
+        nn.ConvTranspose2d(128, 16, kernel_size=4, stride=2, padding=1), # 16x7x7 -> 16x14x14
+        nn.GELU(),
         nn.Dropout(dropout_prob),
         nn.ConvTranspose2d(16, 1, kernel_size=4, stride=2, padding=1), # 16x14x14 -> 1x28x28
         )

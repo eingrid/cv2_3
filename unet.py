@@ -40,7 +40,7 @@ class DoubleConvLayer(nn.Module):
         return x
 
 class DownSampleLayer(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, use_condition = False):
         super().__init__()
         self.pool = nn.MaxPool2d(2)
         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
@@ -48,14 +48,23 @@ class DownSampleLayer(nn.Module):
         self.norm1 = nn.GroupNorm(8, out_channels)
         self.norm2 = nn.GroupNorm(8, out_channels)
         self.linear_time = nn.Linear(100, out_channels)
+        self.use_condition = use_condition
+        if use_condition:
+            self.linear_condition = nn.Linear(64, out_channels)
         self.shortcut = nn.Conv2d(in_channels, out_channels, 1)
             
-    def forward(self, x, time_latent):
-        # identity = self.shortcut(x)
-        
+    def forward(self, x, time_latent, condition = None):
+
         x = self.pool(x)
         x = self.conv1(x)
         x = self.norm1(x)
+        if condition is not None and self.use_condition:
+            condition_vector = self.linear_condition(condition)
+            x = x + self.linear_time(time_latent)[..., None, None] + condition_vector[..., None, None]
+        elif condition is None and self.use_condition == False:
+            x = x + self.linear_time(time_latent)[..., None, None]
+        else:
+            raise ValueError("You can not use condition with this model, please check self.use_condition or do not pass condition")
         x = x + self.linear_time(time_latent)[..., None, None]
         x = F.gelu(x)
         
@@ -66,7 +75,7 @@ class DownSampleLayer(nn.Module):
         return x
 
 class UpSampleLayer(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, use_condition = False):
         super().__init__()
         self.up = nn.ConvTranspose2d(in_channels, out_channels, 2, stride=2)
         self.conv1 = nn.Conv2d(out_channels * 2, out_channels, 3, padding=1)
@@ -74,13 +83,24 @@ class UpSampleLayer(nn.Module):
         self.norm1 = nn.GroupNorm(8, out_channels)
         self.norm2 = nn.GroupNorm(8, out_channels)
         self.linear_time = nn.Linear(100, out_channels)
+        self.use_condition = use_condition
+        if use_condition:
+            self.linear_condition = nn.Linear(64, out_channels)
         
-    def forward(self, x1, x2, time_latent):
+    def forward(self, x1, x2, time_latent, condition = None):
         x1 = self.up(x1)
         x = torch.cat([x2, x1], dim=1)
         x = self.conv1(x)
         x = self.norm1(x)
-        x = x + self.linear_time(time_latent)[..., None, None]
+
+        if condition is not None and self.use_condition:
+            condition_vector = self.linear_condition(condition)
+            x = x + self.linear_time(time_latent)[..., None, None] + condition_vector[..., None, None]
+        elif condition is None and self.use_condition == False:
+            x = x + self.linear_time(time_latent)[..., None, None]
+        else:
+            raise ValueError("You can not use condition with this model, please check self.use_condition or do not pass condition")
+
         x = F.gelu(x)
         x = self.conv2(x)
         x = self.norm2(x)
@@ -160,7 +180,8 @@ class UNetTimed(nn.Module):
         
         self.out = nn.Conv2d(c, out_channels, 1)
     
-    def forward(self, x, t):
+    def forward(self, x, t, condition = None):
+        # condition just to have same interface
         time_latent = self.time_embedding(t)
         
         # In
@@ -190,21 +211,18 @@ class UNetTimed(nn.Module):
         return self.out(x)
 
 
-    
-
-
 class UNetTimedWithVAE(nn.Module):
     def __init__(self, vae, in_channels=1, out_channels=1, time_dim=100):
         super().__init__()
         self.time_embedding = TimeEmbedding(time_dim)
         self.vae = vae
-        c = 128
+        c = 64
         self.doubleconv1 = DoubleConvLayer(in_channels, c)
-        self.pool = nn.MaxPool2d(2, 2)
         
         # 28x28 -> 14x14
         self.downsample1 = DownSampleLayer(c, c * 2)
         self.selfattention1 = SelfAttentionLayer(c * 2)
+        self.double_conv2 = DoubleConvLayer(c * 2, c * 2)
         
         # 14x14 -> 7x7
         self.downsample2 = DownSampleLayer(c * 2, c * 4)
@@ -225,10 +243,14 @@ class UNetTimedWithVAE(nn.Module):
         # 14x14 -> 28x28
         self.upsample3 = UpSampleLayer(c * 2, c)
         self.selfattention6 = SelfAttentionLayer(c)
+        self.double_conv4 = DoubleConvLayer(c * 2, c * 2)
+
+        self.double_conv_last = DoubleConvLayer(c , c )
         
         self.out = nn.Conv2d(c, out_channels, 1)
     
-    def forward(self, x, t):
+    def forward(self, x, t, condition = None):
+        #condition just to have same interface
 
         time_latent = self.time_embedding(t)
         # x = self.vae.encode(x)
@@ -243,6 +265,7 @@ class UNetTimedWithVAE(nn.Module):
         # DownSampling
         x2 = self.downsample1(x1, time_latent)  # 14x14
         x2 = self.selfattention1(x2)
+        x2 = self.double_conv2(x2)
         
         x3 = self.downsample2(x2, time_latent)  # 7x7
         x3 = self.selfattention2(x3) # не берем
@@ -256,9 +279,12 @@ class UNetTimedWithVAE(nn.Module):
         # Upsampling
         x = self.upsample2(x3, x2, time_latent)  # 14x14 (in last, prev 14x14, time)
         x = self.selfattention5(x)
+        x = self.double_conv4(x2)
         
+
         x = self.upsample3(x, x1, time_latent)  # 28x28 (in last, prev 28x28, time)
         x = self.selfattention6(x)  # 28x28
+        x = self.double_conv_last(x)
         # Out
         x = self.out(x)
         #reshape to B,64
@@ -300,17 +326,17 @@ class UNetTimedWithVAEConditioned(nn.Module):
         self.doubleconv1 = DoubleConvLayer(in_channels, c)
         
         # 28x28 -> 14x14
-        self.downsample1 = DownSampleLayer(c, c * 2)
-        self.selfattention1 = SelfAttentionLayer(c * 2, False)
+        self.downsample1 = DownSampleLayer(c, c * 2,use_condition)
+        self.selfattention1 = SelfAttentionLayer(c * 2, use_condition)
         
         # 14x14 -> 7x7
-        self.downsample2 = DownSampleLayer(c * 2, c * 4)
+        self.downsample2 = DownSampleLayer(c * 2, c * 4,use_condition)
         self.selfattention2 = SelfAttentionLayer(c * 4, False)
         
         self.middle_conv1 = DoubleConvLayer(c * 4, c * 4)
         self.middle_conv2 = DoubleConvLayer(c * 4, c * 4)
-        self.selfattention_bottleneck = SelfAttentionLayer(c * 4, False)
-        self.crossattention_bottleneck = SelfAttentionLayer(c * 4, use_condition)
+        # self.selfattention_bottleneck = SelfAttentionLayer(c * 4, False)
+        # self.crossattention_bottleneck = SelfAttentionLayer(c * 4, use_condition)
         # 7x7 -> 7x7
         self.middle_conv3 = DoubleConvLayer(c * 4, c * 4)
         
@@ -319,14 +345,16 @@ class UNetTimedWithVAEConditioned(nn.Module):
         # self.selfattention4 = SelfAttentionLayer(c * 4, use_condition)
         
         # 7x7 -> 14x14
-        self.upsample2 = UpSampleLayer(c * 4, c * 2)
-        self.selfattention5 = SelfAttentionLayer(c * 2, False)
+        self.upsample2 = UpSampleLayer(c * 4, c * 2,use_condition)
+        self.selfattention5 = SelfAttentionLayer(c * 2, use_condition)
         
         # 14x14 -> 28x28
-        self.upsample3 = UpSampleLayer(c * 2, c)
+        self.upsample3 = UpSampleLayer(c * 2, c, use_condition)
         self.selfattention6 = SelfAttentionLayer(c, False)
         
         self.out = nn.Conv2d(c, out_channels, 1)
+
+        # self.add_self_attention_encoder = SelfAttentionLayer(c*4,True)
     
     def get_condition_latent(self, condition : torch.Tensor):
         safe_condition = torch.where(condition == -1, 
@@ -363,25 +391,25 @@ class UNetTimedWithVAEConditioned(nn.Module):
 
 
         # DownSampling
-        x2 = self.downsample1(x1, time_latent)  # 14x14
+        x2 = self.downsample1(x1, time_latent,condition_latent)  # 14x14
         x2 = self.selfattention1(x2, condition_latent)
         
-        x3 = self.downsample2(x2, time_latent)  # 7x7
+        x3 = self.downsample2(x2, time_latent,condition_latent)  # 7x7
         x3 = self.selfattention2(x3, condition_latent)
         
         # Bottleneck
         x3 = self.middle_conv1(x3)  # 7x7
         x3 = self.middle_conv2(x3)  # 7x7
-        x3 = self.selfattention_bottleneck(x3, condition_latent)
-        x3 = self.crossattention_bottleneck(x3, condition_latent)
+        # x3 = self.selfattention_bottleneck(x3, condition_latent)
+        # x3 = self.crossattention_bottleneck(x3, condition_latent)
         x3 = self.middle_conv3(x3)  # 7x7
 
 
         # Upsampling
-        x = self.upsample2(x3, x2, time_latent)  # 14x14 (in last, prev 14x14, time)
+        x = self.upsample2(x3, x2, time_latent,condition_latent)  # 14x14 (in last, prev 14x14, time)
         x = self.selfattention5(x, condition_latent)
         
-        x = self.upsample3(x, x1, time_latent)  # 28x28 (in last, prev 28x28, time)
+        x = self.upsample3(x, x1, time_latent,condition_latent)  # 28x28 (in last, prev 28x28, time)
         x = self.selfattention6(x, condition_latent)  # 28x28
         # Out
         x = self.out(x)
